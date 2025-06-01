@@ -124,27 +124,40 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 		if err := c.updateLHVolumeAttachment(networkFS, true); err != nil {
 			return nil, err
 		}
-		networkFSCpy := networkFS.DeepCopy()
-		networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabling
-		networkFSCpy.Status.Status = networkfsv1.EndpointStatusNotReady
-		networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
-		if !reflect.DeepEqual(networkFS, networkFSCpy) {
-			return c.NetworkFilsystems.UpdateStatus(networkFSCpy)
+		networkFSNew := setNetworkFSToEnabling(networkFS, networkfsv1.NetworkFSTypeNFS)
+		if !reflect.DeepEqual(networkFS, networkFSNew) {
+			return c.NetworkFilsystems.UpdateStatus(networkFSNew)
 		}
 	}
 
 	if lhShareMgr.Status.State != longhornv2.ShareManagerStateRunning {
+		// check the LHVA again, we encounter the corner case that the lhva is cleaned up
+		// when we disable/enable the network filesystem very soon.
+		lhva, err := c.lhClient.LonghornV1beta2().VolumeAttachments(utils.LHNameSpace).Get(context.Background(), networkFS.Name, metav1.GetOptions{})
+		if err != nil {
+			logrus.Errorf("Failed to get Longhorn volume attachment %s: %v", networkFS.Name, err)
+			return nil, err
+		}
+		if len(lhva.Spec.AttachmentTickets) == 0 {
+			// this will reset the network filesystem status to disabled
+			// after reconcile, we will retry to enable the network filesystem
+			logrus.Infof("The LHVA %s has no attachment tickets, reset the network filesystem status for retry", networkFS.Name)
+			networkfsNew := setNetworkFSToDefault(networkFS)
+			if !reflect.DeepEqual(networkFS, networkfsNew) {
+				return c.NetworkFilsystems.UpdateStatus(networkfsNew)
+			}
+		}
 		logrus.Infof("Wait the share manager %s to be running", networkFS.Name)
 		return nil, fmt.Errorf("wait the share manager %s to be running", networkFS.Name)
 	}
 
 	// LH RWX volume endpoint should only have one address and one port
+	netFSEndpoint := ""
 	service, err := c.coreClient.Service().Get(utils.LHNameSpace, networkFS.Name, metav1.GetOptions{})
 	if err != nil {
 		logrus.Errorf("Failed to get service %s: %v", networkFS.Name, err)
 		return nil, err
 	}
-	networkFSCpy := networkFS.DeepCopy()
 	if service.Spec.ClusterIP != corev1.ClusterIPNone {
 		// means we depends on the service
 		if service.Spec.ClusterIP == "" {
@@ -152,7 +165,7 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 			logrus.Infof("Skip update on networkfs controller with the first time service init")
 			return nil, nil
 		}
-		networkFSCpy.Status.Endpoint = service.Spec.ClusterIP
+		netFSEndpoint = service.Spec.ClusterIP
 	} else {
 		endpoint, err := c.endpointsClient.Get(utils.LHNameSpace, networkFS.Name, metav1.GetOptions{})
 		if err != nil && !errors.IsNotFound(err) {
@@ -168,7 +181,7 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 		if endpoint.Subsets[0].Ports[0].Name != "nfs" {
 			return nil, fmt.Errorf("endpoint %s has no nfs port", networkFS.Name)
 		}
-		networkFSCpy.Status.Endpoint = endpoint.Subsets[0].Addresses[0].IP
+		netFSEndpoint = endpoint.Subsets[0].Addresses[0].IP
 	}
 
 	pv, err := c.coreClient.PersistentVolume().Get(networkFS.Name, metav1.GetOptions{})
@@ -180,20 +193,9 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 	if _, found := pv.Spec.CSI.VolumeAttributes["nfsOptions"]; found {
 		opts = pv.Spec.CSI.VolumeAttributes["nfsOptions"]
 	}
+	networkFSNew := setNetworkFSToEnabled(networkFS, networkfsv1.NetworkFSTypeNFS, netFSEndpoint, opts)
 	// update network filesystem status
-	networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabled
-	networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
-	networkFSCpy.Status.Status = networkfsv1.EndpointStatusReady
-	networkFSCpy.Status.MountOpts = opts
-	conds := networkfsv1.NetworkFSCondition{
-		Type:               networkfsv1.ConditionTypeReady,
-		Status:             corev1.ConditionTrue,
-		LastTransitionTime: metav1.Now(),
-		Reason:             "Endpoint is ready",
-		Message:            "Endpoint contains the corresponding address",
-	}
-	networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
-	return c.NetworkFilsystems.UpdateStatus(networkFSCpy)
+	return c.NetworkFilsystems.UpdateStatus(networkFSNew)
 }
 
 func (c *Controller) updateLHVolumeAttachment(networkFS *networkfsv1.NetworkFilesystem, attach bool) error {
@@ -278,4 +280,53 @@ func isEnabling(networkFS *networkfsv1.NetworkFilesystem) bool {
 
 func isDisabling(networkFS *networkfsv1.NetworkFilesystem) bool {
 	return networkFS.Status.State == networkfsv1.NetworkFSStateDisabling
+}
+
+func setNetworkFSToDefault(networkFS *networkfsv1.NetworkFilesystem) *networkfsv1.NetworkFilesystem {
+	networkFSCpy := networkFS.DeepCopy()
+	setNetworkFSStatus(networkFSCpy, networkfsv1.NetworkFSStateDisabled, networkfsv1.EndpointStatusNotReady)
+	return networkFSCpy
+}
+
+func setNetworkFSToEnabling(networkFS *networkfsv1.NetworkFilesystem, targetNetFS string) *networkfsv1.NetworkFilesystem {
+	networkFSCpy := networkFS.DeepCopy()
+	setNetworkFSStatus(networkFSCpy, networkfsv1.NetworkFSStateEnabling, networkfsv1.EndpointStatusNotReady)
+	setNetworkFSType(networkFSCpy, targetNetFS)
+	return networkFSCpy
+}
+
+func setNetworkFSToEnabled(networkFS *networkfsv1.NetworkFilesystem, targetNetFS, endpoint, opts string) *networkfsv1.NetworkFilesystem {
+	networkFSCpy := networkFS.DeepCopy()
+	setNetworkFSStatus(networkFSCpy, networkfsv1.NetworkFSStateEnabled, networkfsv1.EndpointStatusReady)
+	setNetworkFSType(networkFSCpy, targetNetFS)
+	setNetworkFSEndpoint(networkFSCpy, endpoint)
+	setNetworkFSOpts(networkFSCpy, opts)
+	conds := networkfsv1.NetworkFSCondition{
+		Type:               networkfsv1.ConditionTypeEndpointChanged,
+		Status:             corev1.ConditionTrue,
+		LastTransitionTime: metav1.Now(),
+		Reason:             "Endpoint is changed",
+		Message:            fmt.Sprintf("Endpoint is changed to %s", endpoint),
+	}
+	networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
+	return networkFSCpy
+}
+
+func setNetworkFSStatus(networkFS *networkfsv1.NetworkFilesystem,
+	state networkfsv1.NetworkFSState,
+	status networkfsv1.EndpointStatus) {
+	networkFS.Status.State = state
+	networkFS.Status.Status = status
+}
+
+func setNetworkFSType(networkFS *networkfsv1.NetworkFilesystem, targetNetFS string) {
+	networkFS.Status.Type = targetNetFS
+}
+
+func setNetworkFSEndpoint(networkFS *networkfsv1.NetworkFilesystem, endpoint string) {
+	networkFS.Status.Endpoint = endpoint
+}
+
+func setNetworkFSOpts(networkFS *networkfsv1.NetworkFilesystem, opts string) {
+	networkFS.Status.MountOpts = opts
 }
