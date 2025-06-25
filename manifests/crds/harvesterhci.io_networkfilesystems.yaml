@@ -58,7 +58,7 @@ spec:
             properties:
               desiredState:
                 description: desired state of the networkFS endpoint, options are
-                  "Disabled", "Enabling", "Enabled", "Disabling", or "Unknown"
+                  "Disabled", "Enabled", "Expand", or "Unknown"
                 type: string
               networkFSName:
                 description: name of the networkFS to which the endpoint is exported
@@ -107,7 +107,7 @@ spec:
               state:
                 default: Disabled
                 description: the current state of the networkFS endpoint, options
-                  are "Enabled", "Enabling", "Disabling", "Disabled", or "Unknown"
+                  are "Enabled", "Enabling", "Disabling", "Disabled" or "Unknown"
                 enum:
                 - Enabled
                 - Enabling
@@ -122,6 +122,7 @@ spec:
                 - Ready
                 - NotReady
                 - Reconciling
+                - Expanding
                 - Unknown
                 type: string
               type:

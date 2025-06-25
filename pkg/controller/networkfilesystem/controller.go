@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 
 	longhornv2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	lhclientset "github.com/longhorn/longhorn-manager/k8s/pkg/client/clientset/versioned"
@@ -12,16 +13,26 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/utils/pointer"
 
 	networkfsv1 "github.com/harvester/networkfs-manager/pkg/apis/harvesterhci.io/v1beta1"
 	ctlntefsv1 "github.com/harvester/networkfs-manager/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	"github.com/harvester/networkfs-manager/pkg/utils"
 )
 
+const (
+	mntPathPrefix = "/data/"
+	expanderName  = "expander"
+	expanderCmd   = "sleep"
+	expanderArg   = "300"
+)
+
 type Controller struct {
 	namespace string
 	nodeName  string
 
+	clientSet         *kubernetes.Clientset
 	coreClient        ctlv1.Interface
 	lhClient          *lhclientset.Clientset
 	endpointsClient   ctlv1.EndpointsController
@@ -34,11 +45,14 @@ const (
 )
 
 // Register register the longhorn node CRD controller
-func Register(ctx context.Context, coreClient ctlv1.Interface, lhClient *lhclientset.Clientset, endpoints ctlv1.EndpointsController, netfilesystems ctlntefsv1.NetworkFilesystemController, opt *utils.Option) error {
+func Register(ctx context.Context, clientSet *kubernetes.Clientset, coreClient ctlv1.Interface,
+	lhClient *lhclientset.Clientset, endpoints ctlv1.EndpointsController,
+	netfilesystems ctlntefsv1.NetworkFilesystemController, opt *utils.Option) error {
 
 	c := &Controller{
 		namespace:         opt.Namespace,
 		nodeName:          opt.NodeName,
+		clientSet:         clientSet,
 		coreClient:        coreClient,
 		lhClient:          lhClient,
 		endpointsClient:   endpoints,
@@ -58,8 +72,7 @@ func (c *Controller) OnNetworkFSChange(_ string, networkFS *networkfsv1.NetworkF
 	logrus.Infof("Handling network filesystem %s change event", networkFS.Name)
 
 	if networkFS.Spec.DesiredState == networkFS.Status.State {
-		logrus.Infof("Skip this round because the network filesystem %s is already in desired state %s", networkFS.Name, networkFS.Spec.DesiredState)
-		return nil, nil
+		return c.checkAndProcessExpand(networkFS)
 	}
 
 	if networkFS.Status.State == "" {
@@ -88,6 +101,22 @@ func (c *Controller) OnNetworkFSChange(_ string, networkFS *networkfsv1.NetworkF
 	return nil, nil
 }
 
+func (c *Controller) checkAndProcessExpand(networkFS *networkfsv1.NetworkFilesystem) (*networkfsv1.NetworkFilesystem, error) {
+	pvc, err := c.getPVC(networkFS)
+	if err != nil {
+		return nil, err
+	}
+
+	if !isEnabled(networkFS) {
+		return nil, nil
+	}
+
+	if utils.PVCNeedExpand(pvc) {
+		return c.expandNetworkFS(networkFS, pvc)
+	}
+	return c.completeExpandNetworkFS(networkFS, pvc)
+}
+
 func (c *Controller) disableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (*networkfsv1.NetworkFilesystem, error) {
 	logrus.Infof("Disable network filesystem %s", networkFS.Name)
 
@@ -102,6 +131,142 @@ func (c *Controller) disableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) 
 		}
 	}
 	return nil, nil
+}
+
+func (c *Controller) getClusterRepoImage() string {
+	deployContent, err := c.clientSet.AppsV1().Deployments("cattle-system").Get(context.TODO(), "harvester-cluster-repo", metav1.GetOptions{})
+	if err != nil {
+		logrus.Errorf("Failed to get the harvester-cluster-repo deployment: %v", err)
+		return ""
+	}
+
+	// ensure the harvester-cluster-repo deployment has only one container
+	containerItem := deployContent.Spec.Template.Spec.Containers[0]
+	if strings.HasPrefix(containerItem.Image, "rancher/harvester-cluster-repo") {
+		return containerItem.Image
+	}
+	logrus.Errorf("Failed to get the harvester-cluster-repo Image: %v", containerItem.Image)
+	return ""
+}
+
+func generateRWXVolPodName(pvc *corev1.PersistentVolumeClaim) string {
+	return pvc.Spec.VolumeName
+}
+
+func (c *Controller) createExpanderPodIfNeed(pvc *corev1.PersistentVolumeClaim) error {
+	expanderPodName := generateRWXVolPodName(pvc)
+	_, err := c.coreClient.Pod().Get(pvc.Namespace, expanderPodName, metav1.GetOptions{})
+	if err == nil {
+		return nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return err
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: pvc.Namespace,
+			Name:      expanderPodName,
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: pvc.Spec.VolumeName,
+					VolumeSource: corev1.VolumeSource{
+						PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+							ClaimName: pvc.Name,
+						},
+					},
+				},
+			},
+			Containers: []corev1.Container{
+				{
+					Name:            expanderName,
+					Image:           c.getClusterRepoImage(),
+					ImagePullPolicy: corev1.PullIfNotPresent,
+					SecurityContext: &corev1.SecurityContext{
+						Privileged: pointer.Bool(true),
+					},
+					VolumeMounts: []corev1.VolumeMount{
+						{Name: pvc.Spec.VolumeName, MountPath: mntPathPrefix + pvc.Spec.VolumeName},
+					},
+					Command: []string{expanderCmd},
+					Args:    []string{expanderArg},
+				},
+			},
+		},
+	}
+
+	logrus.Infof("create pod %s/%s for expand netFS", pvc.Namespace, expanderPodName)
+	if _, err := c.coreClient.Pod().Create(pod); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Controller) doExpandNetworkFS(netFS *networkfsv1.NetworkFilesystem, pvc *corev1.PersistentVolumeClaim) (*networkfsv1.NetworkFilesystem, error) {
+	if err := c.createExpanderPodIfNeed(pvc); err != nil {
+		return nil, err
+	}
+
+	netFSCpy := netFS.DeepCopy()
+	netFSCpy.Status.Status = networkfsv1.EndpointStatus(networkfsv1.ConditionTypeExpanding)
+	if reflect.DeepEqual(netFS, netFSCpy) {
+		return netFS, nil
+	}
+	return c.NetworkFilsystems.UpdateStatus(netFSCpy)
+}
+
+func (c *Controller) deleteExpanderPod(pvc *corev1.PersistentVolumeClaim) error {
+	podName := generateRWXVolPodName(pvc)
+	err := c.coreClient.Pod().Delete(pvc.Namespace, podName, &metav1.DeleteOptions{})
+	if errors.IsNotFound(err) {
+		return nil
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Controller) completeExpandNetworkFS(netFS *networkfsv1.NetworkFilesystem, pvc *corev1.PersistentVolumeClaim) (*networkfsv1.NetworkFilesystem, error) {
+	logrus.Infof("Expand network filesystem %s completes or not needed", netFS.Name)
+
+	if err := c.deleteExpanderPod(pvc); err != nil {
+		return nil, err
+	}
+
+	netFSCpy := netFS.DeepCopy()
+	netFSCpy.Status.Status = networkfsv1.EndpointStatus(networkfsv1.ConditionTypeReady)
+	logrus.Infof("Update %s status as %s", netFSCpy.Name, netFSCpy.Status.Status)
+	if reflect.DeepEqual(netFS, netFSCpy) {
+		return netFS, nil
+	}
+	return c.NetworkFilsystems.UpdateStatus(netFSCpy)
+}
+
+func (c *Controller) expandNetworkFS(netFS *networkfsv1.NetworkFilesystem, pvc *corev1.PersistentVolumeClaim) (*networkfsv1.NetworkFilesystem, error) {
+	logrus.Infof("Start expand network filesystem %s", netFS.Name)
+
+	if netFS.Status.Status == networkfsv1.EndpointStatus(networkfsv1.ConditionTypeExpanding) {
+		return netFS, nil
+	}
+	return c.doExpandNetworkFS(netFS, pvc)
+}
+
+func (c *Controller) getPVC(networkFS *networkfsv1.NetworkFilesystem) (*corev1.PersistentVolumeClaim, error) {
+	lhVol, err := c.lhClient.LonghornV1beta2().Volumes(utils.LHNameSpace).Get(context.Background(), networkFS.Name, metav1.GetOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	pvcNameSpace := lhVol.Status.KubernetesStatus.Namespace
+	pvcName := lhVol.Status.KubernetesStatus.PVCName
+	return c.coreClient.PersistentVolumeClaim().Get(pvcNameSpace, pvcName, metav1.GetOptions{})
 }
 
 func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (*networkfsv1.NetworkFilesystem, error) {
@@ -274,6 +439,10 @@ func (c *Controller) doAttachLHVolumeAttachment(networkFS *networkfsv1.NetworkFi
 
 func isEnabling(networkFS *networkfsv1.NetworkFilesystem) bool {
 	return networkFS.Status.State == networkfsv1.NetworkFSStateEnabling
+}
+
+func isEnabled(networkFS *networkfsv1.NetworkFilesystem) bool {
+	return networkFS.Status.State == networkfsv1.NetworkFSStateEnabled
 }
 
 func isDisabling(networkFS *networkfsv1.NetworkFilesystem) bool {

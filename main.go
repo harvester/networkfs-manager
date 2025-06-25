@@ -11,6 +11,14 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/harvester/networkfs-manager/pkg/controller/endpoint"
+	"github.com/harvester/networkfs-manager/pkg/controller/networkfilesystem"
+	"github.com/harvester/networkfs-manager/pkg/controller/pvc"
+	"github.com/harvester/networkfs-manager/pkg/controller/service"
+	"github.com/harvester/networkfs-manager/pkg/controller/sharemanager"
+	ntefsv1 "github.com/harvester/networkfs-manager/pkg/generated/controllers/harvesterhci.io"
+	ctrllonghorn "github.com/harvester/networkfs-manager/pkg/generated/controllers/longhorn.io"
+	utils "github.com/harvester/networkfs-manager/pkg/utils"
 	lhclientset "github.com/longhorn/longhorn-manager/k8s/pkg/client/clientset/versioned"
 	corev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core"
 	"github.com/rancher/wrangler/v3/pkg/kubeconfig"
@@ -20,14 +28,6 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/urfave/cli/v2"
 	"k8s.io/client-go/kubernetes"
-
-	"github.com/harvester/networkfs-manager/pkg/controller/endpoint"
-	"github.com/harvester/networkfs-manager/pkg/controller/networkfilesystem"
-	"github.com/harvester/networkfs-manager/pkg/controller/service"
-	"github.com/harvester/networkfs-manager/pkg/controller/sharemanager"
-	ntefsv1 "github.com/harvester/networkfs-manager/pkg/generated/controllers/harvesterhci.io"
-	ctrllonghorn "github.com/harvester/networkfs-manager/pkg/generated/controllers/longhorn.io"
-	utils "github.com/harvester/networkfs-manager/pkg/utils"
 )
 
 func main() {
@@ -120,6 +120,7 @@ func run(opt *utils.Option) error {
 
 	endpoints := clientv1.Core().V1().Endpoints()
 	services := clientv1.Core().V1().Service()
+	pvcs := clientv1.Core().V1().PersistentVolumeClaim()
 	networkFilsystems := clientNetfs.Harvesterhci().V1beta1().NetworkFilesystem()
 	sharemanagers := lhCtrlClient.Longhorn().V1beta2().ShareManager()
 
@@ -132,7 +133,11 @@ func run(opt *utils.Option) error {
 			logrus.Errorf("failed to register service controller: %v", err)
 		}
 
-		if err := networkfilesystem.Register(ctx, clientv1.Core().V1(), lhClient, endpoints, networkFilsystems, opt); err != nil {
+		if err := pvc.Register(ctx, pvcs, networkFilsystems, opt); err != nil {
+			logrus.Errorf("failed to register service controller: %v", err)
+		}
+
+		if err := networkfilesystem.Register(ctx, client, clientv1.Core().V1(), lhClient, endpoints, networkFilsystems, opt); err != nil {
 			logrus.Errorf("failed to register networkfilesystem controller: %v", err)
 		}
 

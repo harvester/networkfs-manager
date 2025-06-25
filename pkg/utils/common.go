@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/sirupsen/logrus"
+	corev1 "k8s.io/api/core/v1"
 
 	networkfsv1 "github.com/harvester/networkfs-manager/pkg/apis/harvesterhci.io/v1beta1"
 )
@@ -46,4 +47,12 @@ func UpdateNetworkFSConds(curConds []networkfsv1.NetworkFSCondition, c networkfs
 	}
 	return curConds
 
+}
+
+func PVCNeedExpand(pvc *corev1.PersistentVolumeClaim) bool {
+	return pvc.Spec.Resources.Requests.Storage().Value() != pvc.Status.Capacity.Storage().Value()
+}
+
+func NetFSInExpanding(netFS *networkfsv1.NetworkFilesystem) bool {
+	return netFS.Status.Status == networkfsv1.EndpointStatus(networkfsv1.ConditionTypeExpanding)
 }

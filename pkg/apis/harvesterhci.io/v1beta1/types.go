@@ -18,6 +18,7 @@ const (
 	NetworkFSStateDisabling NetworkFSState = "Disabling"
 	// NetworkFSStateDisabled indicates the networkFS endpoint is disabled
 	NetworkFSStateDisabled NetworkFSState = "Disabled"
+
 	// NetworkFSStateUnknown indicates the networkFS endpoint state is unknown (initial state)
 	NetworkFSStateUnknown NetworkFSState = "Unknown"
 
@@ -38,6 +39,8 @@ const (
 	ConditionTypeReconciling ConditionType = "Reconciling"
 	// ConditionTypeEndpointChanged indicates the networkFS endpoint is changed
 	ConditionTypeEndpointChanged ConditionType = "EndpointChanged"
+	// ConditionTypeExpanding indicates the networkFS is expanding
+	ConditionTypeExpanding ConditionType = "Expanding"
 
 	// NetworkFSTypeNFS indicates the networkFS endpoint is NFS
 	NetworkFSTypeNFS string = "NFS"
@@ -65,8 +68,8 @@ type NetworkFSSpec struct {
 	// +kubebuilder:validation:Required
 	NetworkFSName string `json:"networkFSName"`
 
-	// desired state of the networkFS endpoint, options are "Disabled", "Enabling", "Enabled", "Disabling", or "Unknown"
-	// +kubebuilder:validation:Required:Enum:=Disabled;Enabling;Enabled;Disabling;Unknown
+	// desired state of the networkFS endpoint, options are "Disabled", "Enabled", "Expand", or "Unknown"
+	// +kubebuilder:validation:Required:Enum:=Disabled;Enabled;Expand;Unknown
 	DesiredState NetworkFSState `json:"desiredState"`
 
 	// perferred nodes to which the networkFS endpoint is exported
@@ -90,7 +93,7 @@ type NetworkFSStatus struct {
 	// +kubebuilder:default:=""
 	Endpoint string `json:"endpoint"`
 
-	// the current state of the networkFS endpoint, options are "Enabled", "Enabling", "Disabling", "Disabled", or "Unknown"
+	// the current state of the networkFS endpoint, options are "Enabled", "Enabling", "Disabling", "Disabled" or "Unknown"
 	// +kubebuilder:validation:Enum:=Enabled;Enabling;Disabling;Disabled;Unknown
 	// +kubebuilder:default:=Disabled
 	State NetworkFSState `json:"state"`
@@ -101,7 +104,7 @@ type NetworkFSStatus struct {
 	Type string `json:"type"`
 
 	// the status of the endpoint
-	// +kubebuilder:validation:Enum:=Ready;NotReady;Reconciling;Unknown
+	// +kubebuilder:validation:Enum:=Ready;NotReady;Reconciling;Expanding;Unknown
 	// +kubebuilder:default:=NotReady
 	Status EndpointStatus `json:"status"`
 
