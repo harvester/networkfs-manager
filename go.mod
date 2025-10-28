@@ -1,6 +1,6 @@
 module github.com/harvester/networkfs-manager
 
-go 1.24.2
+go 1.25.3
 
 require (
 	github.com/longhorn/longhorn-manager v1.7.0
