@@ -60,7 +60,7 @@ The `Networkfilesystem` CR is used to store the corresponding network filesystem
 The `desiredState` is used to control the state of the network filesystem. Usually `Enabled` or `Disabled`. The `networkFSName` is the name (usually path) of the network filesystem and is used for the mount path, like the entry point. The `state` is the state that the current state compares with the `desiredState`. The `status` is the status of the network filesystem. The `mountOptions` are the recommended mount options to hint the user to mount the network filesystem. The `type` is the type of the network filesystem. Now, only support `NFS`.
 
 ## License
-Copyright (c) 2025 [Rancher Labs, Inc.](http://rancher.com)
+Copyright 2024-2026 [SUSE, LLC.](https://www.suse.com/)
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
