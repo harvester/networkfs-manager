@@ -7,7 +7,7 @@ require (
 	github.com/rancher/lasso v0.2.5
 	github.com/rancher/wrangler/v3 v3.3.1
 	github.com/sirupsen/logrus v1.9.4
-	github.com/urfave/cli/v2 v2.27.3
+	github.com/urfave/cli/v2 v2.27.7
 	k8s.io/api v0.34.5
 	k8s.io/apimachinery v0.34.5
 	k8s.io/client-go v0.34.5
