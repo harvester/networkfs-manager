@@ -2,9 +2,13 @@ package networkfilesystem
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
+	"strings"
 
+	harvesterutil "github.com/harvester/harvester/pkg/util"
+	networkv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 	longhornv2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	lhclientset "github.com/longhorn/longhorn-manager/k8s/pkg/client/clientset/versioned"
 	ctlv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
@@ -31,6 +35,10 @@ type Controller struct {
 
 const (
 	netFSHandlerName = "harvester-network-filesystem-handler"
+
+	rwxStaticIPAnnotation  = harvesterutil.ShareManagerStaticIPAnnotation
+	rwxInterfaceAnnotation = harvesterutil.ShareManagerIfaceAnnotation
+	shareManagerPodPrefix  = "share-manager-"
 )
 
 // Register register the longhorn node CRD controller
@@ -151,37 +159,13 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 		return nil, fmt.Errorf("wait the share manager %s to be running", networkFS.Name)
 	}
 
-	// LH RWX volume endpoint should only have one address and one port
-	netFSEndpoint := ""
-	service, err := c.coreClient.Service().Get(utils.LHNameSpace, networkFS.Name, metav1.GetOptions{})
+	netFSEndpoint, err := c.getNetworkFSEndpoint(networkFS, lhShareMgr)
 	if err != nil {
-		logrus.Errorf("Failed to get service %s: %v", networkFS.Name, err)
 		return nil, err
 	}
-	if service.Spec.ClusterIP != corev1.ClusterIPNone {
-		// means we depends on the service
-		if service.Spec.ClusterIP == "" {
-			// first init, service controller will update
-			logrus.Infof("Skip update on networkfs controller with the first time service init")
-			return nil, nil
-		}
-		netFSEndpoint = service.Spec.ClusterIP
-	} else {
-		endpoint, err := c.endpointsClient.Get(utils.LHNameSpace, networkFS.Name, metav1.GetOptions{})
-		if err != nil && !errors.IsNotFound(err) {
-			logrus.Errorf("Failed to get endpoint %s: %v", networkFS.Name, err)
-		}
-		if len(endpoint.Subsets) == 0 {
-			logrus.Infof("Endpoint %s has no subsets (not ready), skip this round!", networkFS.Name)
-			return nil, nil
-		}
-		if len(endpoint.Subsets) > 1 || len(endpoint.Subsets[0].Addresses) > 1 || len(endpoint.Subsets[0].Ports) > 1 {
-			return nil, fmt.Errorf("endpoint %s has more than one subSets", networkFS.Name)
-		}
-		if endpoint.Subsets[0].Ports[0].Name != "nfs" {
-			return nil, fmt.Errorf("endpoint %s has no nfs port", networkFS.Name)
-		}
-		netFSEndpoint = endpoint.Subsets[0].Addresses[0].IP
+	if netFSEndpoint == "" {
+		logrus.Infof("Network filesystem %s endpoint is not ready yet, skip this round", networkFS.Name)
+		return nil, nil
 	}
 
 	pv, err := c.coreClient.PersistentVolume().Get(networkFS.Name, metav1.GetOptions{})
@@ -224,6 +208,159 @@ func (c *Controller) doDeattachLHVolumeAttachment(networkFS *networkfsv1.Network
 		}
 	}
 	return nil
+}
+
+func (c *Controller) getNetworkFSEndpoint(networkFS *networkfsv1.NetworkFilesystem, lhShareMgr *longhornv2.ShareManager) (string, error) {
+	type endpointResolver struct {
+		name string
+		get  func() (string, error)
+	}
+
+	annotations := lhShareMgr.Annotations
+	ifaceName := ""
+	staticIP := ""
+	if annotations != nil {
+		ifaceName = annotations[rwxInterfaceAnnotation]
+		staticIP = annotations[rwxStaticIPAnnotation]
+	}
+
+	// When static IP annotations are valid, only use share manager pod IP
+	useStaticIPOnly := ifaceName != "" && strings.EqualFold(staticIP, "true")
+
+	resolvers := []endpointResolver{
+		{
+			name: "share manager pod IP",
+			get: func() (string, error) {
+				return c.getShareManagerPodEndpoint(lhShareMgr)
+			},
+		},
+		{
+			name: "service cluster IP",
+			get: func() (string, error) {
+				return c.getServiceClusterEndpoint(networkFS.Name)
+			},
+		},
+		{
+			name: "endpoint IP",
+			get: func() (string, error) {
+				return c.getServiceEndpointIP(networkFS.Name)
+			},
+		},
+	}
+
+	for i, resolver := range resolvers {
+		// Skip non-static-IP resolvers when static IP is enabled
+		if useStaticIPOnly && i > 0 {
+			break
+		}
+
+		endpoint, err := resolver.get()
+		if err != nil {
+			return "", err
+		}
+		if endpoint == "" {
+			continue
+		}
+
+		logrus.Infof("Use %s for network filesystem %s endpoint: %s", resolver.name, networkFS.Name, endpoint)
+		return endpoint, nil
+	}
+
+	return "", nil
+}
+
+func (c *Controller) getServiceClusterEndpoint(name string) (string, error) {
+	service, err := c.coreClient.Service().Get(utils.LHNameSpace, name, metav1.GetOptions{})
+	if err != nil {
+		logrus.Errorf("Failed to get service %s: %v", name, err)
+		return "", err
+	}
+	if service.Spec.ClusterIP == corev1.ClusterIPNone || service.Spec.ClusterIP == "" {
+		return "", nil
+	}
+	return service.Spec.ClusterIP, nil
+}
+
+func (c *Controller) getServiceEndpointIP(name string) (string, error) {
+	endpoint, err := c.endpointsClient.Get(utils.LHNameSpace, name, metav1.GetOptions{})
+	if err != nil {
+		if errors.IsNotFound(err) {
+			logrus.Infof("Endpoint %s is not found yet", name)
+			return "", nil
+		}
+		logrus.Errorf("Failed to get endpoint %s: %v", name, err)
+		return "", err
+	}
+	if len(endpoint.Subsets) == 0 {
+		logrus.Infof("Endpoint %s has no subsets (not ready), skip this round!", name)
+		return "", nil
+	}
+	if len(endpoint.Subsets) > 1 || len(endpoint.Subsets[0].Addresses) > 1 || len(endpoint.Subsets[0].Ports) > 1 {
+		return "", fmt.Errorf("endpoint %s has more than one subSets", name)
+	}
+	if endpoint.Subsets[0].Ports[0].Name != "nfs" {
+		return "", fmt.Errorf("endpoint %s has no nfs port", name)
+	}
+
+	return endpoint.Subsets[0].Addresses[0].IP, nil
+}
+
+func (c *Controller) getShareManagerPodEndpoint(lhShareMgr *longhornv2.ShareManager) (string, error) {
+	annotations := lhShareMgr.Annotations
+	if annotations == nil {
+		return "", nil
+	}
+
+	ifaceName := annotations[rwxInterfaceAnnotation]
+	staticIP := annotations[rwxStaticIPAnnotation]
+
+	if ifaceName == "" || !strings.EqualFold(staticIP, "true") {
+		return "", nil
+	}
+
+	podName := shareManagerPodPrefix + lhShareMgr.Name
+	pod, err := c.coreClient.Pod().Get(utils.LHNameSpace, podName, metav1.GetOptions{})
+	if err != nil {
+		logrus.Errorf("Failed to get share manager pod %s: %v", podName, err)
+		return "", err
+	}
+
+	endpoint, err := getPodIPByInterface(pod, ifaceName)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve share manager pod %s interface %s IP: %w", podName, ifaceName, err)
+	}
+	if endpoint == "" {
+		logrus.Infof("Share manager pod %s has no IP on interface %s", podName, ifaceName)
+	}
+	return endpoint, nil
+}
+
+func getPodIPByInterface(pod *corev1.Pod, ifaceName string) (string, error) {
+	if pod == nil || pod.Annotations == nil {
+		return "", nil
+	}
+
+	networkStatusJSON := pod.Annotations[networkv1.NetworkStatusAnnot]
+	if networkStatusJSON == "" {
+		return "", nil
+	}
+
+	var networkStatuses []networkv1.NetworkStatus
+	if err := json.Unmarshal([]byte(networkStatusJSON), &networkStatuses); err != nil {
+		return "", err
+	}
+
+	for _, networkStatus := range networkStatuses {
+		if networkStatus.Interface != ifaceName {
+			continue
+		}
+		if len(networkStatus.IPs) == 0 {
+			return "", nil
+		}
+		return networkStatus.IPs[0], nil
+	}
+
+	return "", nil
 }
 
 func (c *Controller) doAttachLHVolumeAttachment(networkFS *networkfsv1.NetworkFilesystem, lhva *longhornv2.VolumeAttachment) error {
