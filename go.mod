@@ -1,8 +1,12 @@
 module github.com/harvester/networkfs-manager
 
+<<<<<<< HEAD
 go 1.25
 
 toolchain go1.25.3
+=======
+go 1.26
+>>>>>>> 0ebec4b (chore: bump golang 1.26)
 
 require (
 	github.com/longhorn/longhorn-manager v1.7.0
