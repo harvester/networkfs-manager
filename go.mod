@@ -1,13 +1,14 @@
 module github.com/harvester/networkfs-manager
 
 go 1.25
+
 toolchain go1.25.3
 
 require (
 	github.com/longhorn/longhorn-manager v1.7.0
 	github.com/rancher/lasso v0.2.3
 	github.com/rancher/wrangler/v3 v3.2.2
-	github.com/sirupsen/logrus v1.9.3
+	github.com/sirupsen/logrus v1.9.4
 	github.com/urfave/cli/v2 v2.27.3
 	k8s.io/api v0.33.5
 	k8s.io/apimachinery v0.33.5
