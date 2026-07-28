@@ -14,8 +14,11 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	networkfsv1 "github.com/harvester/networkfs-manager/pkg/apis/harvesterhci.io/v1beta1"
+	"github.com/harvester/networkfs-manager/pkg/controller/endpoint"
+	networkfsstatus "github.com/harvester/networkfs-manager/pkg/controller/networkfilesystem/status"
 	ctlntefsv1 "github.com/harvester/networkfs-manager/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	"github.com/harvester/networkfs-manager/pkg/utils"
 )
@@ -24,28 +27,36 @@ type Controller struct {
 	namespace string
 	nodeName  string
 
-	coreClient          ctlv1.Interface
-	lhClient            *lhclientset.Clientset
-	endpointSliceClient ctldiscoveryv1.EndpointSliceController
-	NetworkFSCache      ctlntefsv1.NetworkFilesystemCache
-	NetworkFilsystems   ctlntefsv1.NetworkFilesystemController
+	coreClient         ctlv1.Interface
+	lhClient           *lhclientset.Clientset
+	serviceCache       ctlv1.ServiceCache
+	endpointSliceCache ctldiscoveryv1.EndpointSliceCache
+	NetworkFSCache     ctlntefsv1.NetworkFilesystemCache
+	NetworkFilsystems  ctlntefsv1.NetworkFilesystemController
 }
 
 const (
 	netFSHandlerName = "harvester-network-filesystem-handler"
 )
 
-// Register register the longhorn node CRD controller
-func Register(ctx context.Context, coreClient ctlv1.Interface, lhClient *lhclientset.Clientset, endpointSlices ctldiscoveryv1.EndpointSliceController, netfilesystems ctlntefsv1.NetworkFilesystemController, opt *utils.Option) error {
-
+// Register reconciles NetworkFilesystem state and its current endpoint sources.
+func Register(
+	ctx context.Context,
+	coreClient ctlv1.Interface,
+	lhClient *lhclientset.Clientset,
+	endpointSlices ctldiscoveryv1.EndpointSliceController,
+	netfilesystems ctlntefsv1.NetworkFilesystemController,
+	opt *utils.Option,
+) error {
 	c := &Controller{
-		namespace:           opt.Namespace,
-		nodeName:            opt.NodeName,
-		coreClient:          coreClient,
-		lhClient:            lhClient,
-		endpointSliceClient: endpointSlices,
-		NetworkFilsystems:   netfilesystems,
-		NetworkFSCache:      netfilesystems.Cache(),
+		namespace:          opt.Namespace,
+		nodeName:           opt.NodeName,
+		coreClient:         coreClient,
+		lhClient:           lhClient,
+		serviceCache:       coreClient.Service().Cache(),
+		endpointSliceCache: endpointSlices.Cache(),
+		NetworkFilsystems:  netfilesystems,
+		NetworkFSCache:     netfilesystems.Cache(),
 	}
 
 	c.NetworkFilsystems.OnChange(ctx, netFSHandlerName, c.OnNetworkFSChange)
@@ -58,6 +69,13 @@ func (c *Controller) OnNetworkFSChange(_ string, networkFS *networkfsv1.NetworkF
 		return nil, nil
 	}
 	logrus.Infof("Handling network filesystem %s change event", networkFS.Name)
+
+	// Service and EndpointSlice events use this same volume queue. Resolve their
+	// current contents here, even when the volume is already enabled.
+	if networkFS.Spec.DesiredState == networkfsv1.NetworkFSStateEnabled &&
+		networkFS.Status.State == networkfsv1.NetworkFSStateEnabled {
+		return c.reconcileEndpoint(networkFS)
+	}
 
 	if networkFS.Spec.DesiredState == networkFS.Status.State {
 		logrus.Infof("Skip this round because the network filesystem %s is already in desired state %s", networkFS.Name, networkFS.Spec.DesiredState)
@@ -153,48 +171,12 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 		return nil, fmt.Errorf("wait the share manager %s to be running", networkFS.Name)
 	}
 
-	// LH RWX volume endpoint should only have one address and one port
-	netFSEndpoint := ""
-	service, err := c.coreClient.Service().Get(utils.LHNameSpace, networkFS.Name, metav1.GetOptions{})
+	selection, err := c.selectEndpoint(networkFS.Name)
 	if err != nil {
-		logrus.Errorf("Failed to get service %s: %v", networkFS.Name, err)
 		return nil, err
 	}
-	if service.Spec.ClusterIP != corev1.ClusterIPNone {
-		// means we depends on the service
-		if service.Spec.ClusterIP == "" {
-			// first init, service controller will update
-			logrus.Infof("Skip update on networkfs controller with the first time service init")
-			return nil, nil
-		}
-		netFSEndpoint = service.Spec.ClusterIP
-	} else {
-		endpointSlices, err := c.endpointSliceClient.List(utils.LHNameSpace, metav1.ListOptions{
-			LabelSelector: discoveryv1.LabelServiceName + "=" + networkFS.Name,
-		})
-		if err != nil {
-			logrus.Errorf("Failed to list endpointslices of service %s: %v", networkFS.Name, err)
-			return nil, err
-		}
-		if len(endpointSlices.Items) == 0 {
-			logrus.Infof("Service %s has no endpointslice (not ready), skip this round!", networkFS.Name)
-			return nil, nil
-		}
-		if len(endpointSlices.Items) > 1 {
-			return nil, fmt.Errorf("service %s has more than one endpointslice", networkFS.Name)
-		}
-		endpointSlice := &endpointSlices.Items[0]
-		if len(endpointSlice.Endpoints) == 0 || len(endpointSlice.Endpoints[0].Addresses) == 0 {
-			logrus.Infof("EndpointSlice of service %s has no endpoints (not ready), skip this round!", networkFS.Name)
-			return nil, nil
-		}
-		if len(endpointSlice.Endpoints) > 1 || len(endpointSlice.Endpoints[0].Addresses) > 1 || len(endpointSlice.Ports) > 1 {
-			return nil, fmt.Errorf("endpointslice of service %s has more than one endpoint", networkFS.Name)
-		}
-		if len(endpointSlice.Ports) == 0 || endpointSlice.Ports[0].Name == nil || *endpointSlice.Ports[0].Name != "nfs" {
-			return nil, fmt.Errorf("endpointslice of service %s has no nfs port", networkFS.Name)
-		}
-		netFSEndpoint = endpointSlice.Endpoints[0].Addresses[0]
+	if selection.Address == "" {
+		return c.updateEndpoint(networkFS, selection)
 	}
 
 	pv, err := c.coreClient.PersistentVolume().Get(networkFS.Name, metav1.GetOptions{})
@@ -206,9 +188,56 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 	if _, found := pv.Spec.CSI.VolumeAttributes["nfsOptions"]; found {
 		opts = pv.Spec.CSI.VolumeAttributes["nfsOptions"]
 	}
-	networkFSNew := setNetworkFSToEnabled(networkFS, networkfsv1.NetworkFSTypeNFS, netFSEndpoint, opts)
+	networkFSNew := setNetworkFSToEnabled(networkFS, networkfsv1.NetworkFSTypeNFS, selection.Address, opts)
 	// update network filesystem status
 	return c.NetworkFilsystems.UpdateStatus(networkFSNew)
+}
+
+func (c *Controller) reconcileEndpoint(networkFS *networkfsv1.NetworkFilesystem) (*networkfsv1.NetworkFilesystem, error) {
+	selection, err := c.selectEndpoint(networkFS.Name)
+	if err != nil {
+		return nil, err
+	}
+	return c.updateEndpoint(networkFS, selection)
+}
+
+func (c *Controller) updateEndpoint(
+	networkFS *networkfsv1.NetworkFilesystem,
+	selection endpoint.Selection,
+) (*networkfsv1.NetworkFilesystem, error) {
+	networkFSNew := networkfsstatus.ApplySelection(networkFS, selection)
+	if reflect.DeepEqual(networkFS, networkFSNew) {
+		return nil, nil
+	}
+	return c.NetworkFilsystems.UpdateStatus(networkFSNew)
+}
+
+// selectEndpoint resolves the current source in priority order: labeled RWX VIP,
+// regular ClusterIP, then the legacy headless Service's EndpointSlice.
+func (c *Controller) selectEndpoint(volumeName string) (endpoint.Selection, error) {
+	service, err := endpoint.FindService(c.serviceCache, utils.LHNameSpace, volumeName)
+	if err != nil {
+		return endpoint.Selection{}, err
+	}
+
+	selection := endpoint.Select(service, volumeName)
+	if selection.UsesServiceAddress() {
+		return selection, nil
+	}
+
+	selection.Address, err = c.sliceAddress(service.Namespace, service.Name)
+	return selection, err
+}
+
+func (c *Controller) sliceAddress(namespace, serviceName string) (string, error) {
+	endpointSlices, err := c.endpointSliceCache.List(namespace, labels.SelectorFromSet(labels.Set{
+		discoveryv1.LabelServiceName: serviceName,
+	}))
+	if err != nil {
+		return "", err
+	}
+	address, _, err := endpoint.SelectFromSlices(serviceName, endpointSlices)
+	return address, err
 }
 
 func (c *Controller) updateLHVolumeAttachment(networkFS *networkfsv1.NetworkFilesystem, attach bool) error {
