@@ -16,6 +16,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	networkfsv1 "github.com/harvester/networkfs-manager/pkg/apis/harvesterhci.io/v1beta1"
+	"github.com/harvester/networkfs-manager/pkg/controller/endpoint"
 	ctlntefsv1 "github.com/harvester/networkfs-manager/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	"github.com/harvester/networkfs-manager/pkg/utils"
 )
@@ -153,48 +154,12 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 		return nil, fmt.Errorf("wait the share manager %s to be running", networkFS.Name)
 	}
 
-	// LH RWX volume endpoint should only have one address and one port
-	netFSEndpoint := ""
-	service, err := c.coreClient.Service().Get(utils.LHNameSpace, networkFS.Name, metav1.GetOptions{})
+	netFSEndpoint, ready, err := c.resolveEndpoint(networkFS.Name)
 	if err != nil {
-		logrus.Errorf("Failed to get service %s: %v", networkFS.Name, err)
 		return nil, err
 	}
-	if service.Spec.ClusterIP != corev1.ClusterIPNone {
-		// means we depends on the service
-		if service.Spec.ClusterIP == "" {
-			// first init, service controller will update
-			logrus.Infof("Skip update on networkfs controller with the first time service init")
-			return nil, nil
-		}
-		netFSEndpoint = service.Spec.ClusterIP
-	} else {
-		endpointSlices, err := c.endpointSliceClient.List(utils.LHNameSpace, metav1.ListOptions{
-			LabelSelector: discoveryv1.LabelServiceName + "=" + networkFS.Name,
-		})
-		if err != nil {
-			logrus.Errorf("Failed to list endpointslices of service %s: %v", networkFS.Name, err)
-			return nil, err
-		}
-		if len(endpointSlices.Items) == 0 {
-			logrus.Infof("Service %s has no endpointslice (not ready), skip this round!", networkFS.Name)
-			return nil, nil
-		}
-		if len(endpointSlices.Items) > 1 {
-			return nil, fmt.Errorf("service %s has more than one endpointslice", networkFS.Name)
-		}
-		endpointSlice := &endpointSlices.Items[0]
-		if len(endpointSlice.Endpoints) == 0 || len(endpointSlice.Endpoints[0].Addresses) == 0 {
-			logrus.Infof("EndpointSlice of service %s has no endpoints (not ready), skip this round!", networkFS.Name)
-			return nil, nil
-		}
-		if len(endpointSlice.Endpoints) > 1 || len(endpointSlice.Endpoints[0].Addresses) > 1 || len(endpointSlice.Ports) > 1 {
-			return nil, fmt.Errorf("endpointslice of service %s has more than one endpoint", networkFS.Name)
-		}
-		if len(endpointSlice.Ports) == 0 || endpointSlice.Ports[0].Name == nil || *endpointSlice.Ports[0].Name != "nfs" {
-			return nil, fmt.Errorf("endpointslice of service %s has no nfs port", networkFS.Name)
-		}
-		netFSEndpoint = endpointSlice.Endpoints[0].Addresses[0]
+	if !ready {
+		return nil, nil
 	}
 
 	pv, err := c.coreClient.PersistentVolume().Get(networkFS.Name, metav1.GetOptions{})
@@ -209,6 +174,51 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 	networkFSNew := setNetworkFSToEnabled(networkFS, networkfsv1.NetworkFSTypeNFS, netFSEndpoint, opts)
 	// update network filesystem status
 	return c.NetworkFilsystems.UpdateStatus(networkFSNew)
+}
+
+// resolveEndpoint applies endpoint source priority consistently during enable:
+// labeled RWX loadBalancerIP, regular ClusterIP, then EndpointSlice.
+func (c *Controller) resolveEndpoint(volumeName string) (string, bool, error) {
+	service, err := endpoint.FindService(c.coreClient.Service(), utils.LHNameSpace, volumeName)
+	if err != nil {
+		logrus.Errorf("Failed to get endpoint service for network filesystem %s: %v", volumeName, err)
+		return "", false, err
+	}
+
+	selection := endpoint.Select(service, volumeName)
+	if selection.UsesServiceAddress() {
+		return resolveServiceAddress(service.Name, selection)
+	}
+
+	// Legacy RWX networking uses the Longhorn ShareManager headless Service.
+	// It does not publish a Service address, so use its EndpointSlice address.
+	return c.resolveEndpointSliceAddress(service.Name)
+}
+
+func resolveServiceAddress(serviceName string, selection endpoint.Selection) (string, bool, error) {
+	if selection.Address == "" {
+		logrus.Infof("Service %s has no %s yet (not ready), skip this round", serviceName, selection.Source)
+		return "", false, nil
+	}
+	return selection.Address, true, nil
+}
+
+func (c *Controller) resolveEndpointSliceAddress(serviceName string) (string, bool, error) {
+	endpointSlices, err := c.endpointSliceClient.List(utils.LHNameSpace, metav1.ListOptions{
+		LabelSelector: discoveryv1.LabelServiceName + "=" + serviceName,
+	})
+	if err != nil {
+		logrus.Errorf("Failed to list endpointslices of service %s: %v", serviceName, err)
+		return "", false, err
+	}
+	address, ready, err := endpoint.SelectFromSlices(serviceName, endpointSlices.Items)
+	if err != nil {
+		return "", false, err
+	}
+	if !ready {
+		logrus.Infof("Service %s has no EndpointSlice address yet (not ready), skip this round", serviceName)
+	}
+	return address, ready, nil
 }
 
 func (c *Controller) updateLHVolumeAttachment(networkFS *networkfsv1.NetworkFilesystem, attach bool) error {
