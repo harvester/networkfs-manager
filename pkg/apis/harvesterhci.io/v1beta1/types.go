@@ -85,10 +85,17 @@ type NetworkFSStatus struct {
 	// +kubebuilder:default:={}
 	NetworkFSConds []NetworkFSCondition `json:"conditions,omitempty"`
 
-	// the current Endpoint of the networkFS
+	// the current Endpoint of the networkFS, the IPv4 address when the backing
+	// service/endpointslice is dual-stack
 	// +kubebuilder:validation:
 	// +kubebuilder:default:=""
 	Endpoint string `json:"endpoint"`
+
+	// the current IPv6 Endpoint of the networkFS, populated when the backing
+	// service/endpointslice is dual-stack or IPv6-only
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:default:=""
+	EndpointIPv6 string `json:"endpointIPv6,omitempty"`
 
 	// the current state of the networkFS endpoint, options are "Enabled", "Enabling", "Disabling", "Disabled", or "Unknown"
 	// +kubebuilder:validation:Enum:=Enabled;Enabling;Disabling;Disabled;Unknown

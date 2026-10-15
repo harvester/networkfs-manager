@@ -83,6 +83,7 @@ func (c *Controller) OnShareManagerChange(_ string, sharemanager *longhornv1.Sha
 	networkFSCpy := networkFS.DeepCopy()
 	networkFSCpy.Status.State = networkfsv1.NetworkFSStateDisabled
 	networkFSCpy.Status.Endpoint = ""
+	networkFSCpy.Status.EndpointIPv6 = ""
 	networkFSCpy.Status.Status = networkfsv1.EndpointStatusNotReady
 	networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
 	networkFSCpy.Status.MountOpts = ""
