@@ -74,10 +74,21 @@ func (c *Controller) OnServicesChange(_ string, service *corev1.Service) (*corev
 	if service.Spec.ClusterIP == corev1.ClusterIPNone {
 		return nil, nil
 	}
+
+	clusterIPs := service.Spec.ClusterIPs
+	if len(clusterIPs) == 0 && service.Spec.ClusterIP != "" {
+		clusterIPs = []string{service.Spec.ClusterIP}
+	}
+	endpoint, endpointIPv6 := utils.SelectEndpointAddresses(clusterIPs)
+	if endpoint == "" {
+		endpoint = endpointIPv6
+	}
+
 	networkFSCpy := networkFS.DeepCopy()
 	// Not updated, skip the update (we will get a new service CR later)
-	if service.Spec.ClusterIP == "" {
+	if endpoint == "" {
 		networkFSCpy.Status.Endpoint = ""
+		networkFSCpy.Status.EndpointIPv6 = ""
 		networkFSCpy.Status.Status = networkfsv1.EndpointStatusNotReady
 		networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
 		networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabling
@@ -90,8 +101,8 @@ func (c *Controller) OnServicesChange(_ string, service *corev1.Service) (*corev
 		}
 		networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
 	} else {
-		if networkFSCpy.Status.Endpoint != service.Spec.ClusterIP {
-			changedMsg := "Endpoint address is initialized with " + service.Spec.ClusterIP
+		if networkFSCpy.Status.Endpoint != endpoint {
+			changedMsg := "Endpoint address is initialized with " + endpoint
 			if networkFSCpy.Status.Endpoint != "" {
 				changedMsg = "Endpoint address is changed, previous address is " + networkFSCpy.Status.Endpoint
 			}
@@ -104,7 +115,8 @@ func (c *Controller) OnServicesChange(_ string, service *corev1.Service) (*corev
 			}
 			networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
 		}
-		networkFSCpy.Status.Endpoint = service.Spec.ClusterIP
+		networkFSCpy.Status.Endpoint = endpoint
+		networkFSCpy.Status.EndpointIPv6 = endpointIPv6
 		networkFSCpy.Status.Status = networkfsv1.EndpointStatusReady
 		networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
 		networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabling

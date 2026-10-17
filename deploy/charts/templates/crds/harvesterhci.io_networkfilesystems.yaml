@@ -99,7 +99,15 @@ spec:
                 type: array
               endpoint:
                 default: ""
-                description: the current Endpoint of the networkFS
+                description: |-
+                  the current Endpoint of the networkFS, the IPv4 address when the backing
+                  service/endpointslice is dual-stack
+                type: string
+              endpointIPv6:
+                default: ""
+                description: |-
+                  the current IPv6 Endpoint of the networkFS, populated when the backing
+                  service/endpointslice is dual-stack or IPv6-only
                 type: string
               mountOpts:
                 description: the recommend mount options for the networkFS endpoint

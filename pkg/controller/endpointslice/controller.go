@@ -11,6 +11,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	networkfsv1 "github.com/harvester/networkfs-manager/pkg/apis/harvesterhci.io/v1beta1"
 	ctlntefsv1 "github.com/harvester/networkfs-manager/pkg/generated/controllers/harvesterhci.io/v1beta1"
@@ -89,10 +90,30 @@ func (c *Controller) OnEndpointSliceChange(_ string, endpointSlice *discoveryv1.
 		return nil, nil
 	}
 
+	logrus.Debugf("EndpointSlice %s (service %s) has address type %s", endpointSlice.Name, svcName, endpointSlice.AddressType)
+
+	// A dual-stack service has one EndpointSlice per IP family, so a change to one slice
+	// (e.g. the IPv6 one) must not clobber the address already picked from its sibling.
+	// List all slices for the service rather than relying solely on the slice that triggered
+	// this event.
+	siblingSlices, err := c.EndpointSliceCache.List(utils.LHNameSpace, labels.SelectorFromSet(labels.Set{
+		discoveryv1.LabelServiceName: svcName,
+	}))
+	if err != nil {
+		logrus.Errorf("Failed to list endpointslices of service %s: %v", svcName, err)
+		return nil, err
+	}
+
 	networkFSCpy := networkFS.DeepCopy()
-	address := firstReadyAddress(endpointSlice)
+	address, addressIPv6 := firstReadyAddresses(siblingSlices)
+	// Fall back to the IPv6 address only when no IPv4 slice is ready yet, so an IPv6-only
+	// or not-yet-converged dual-stack rollout still gets a usable endpoint.
+	if address == "" {
+		address = addressIPv6
+	}
 	if address == "" {
 		networkFSCpy.Status.Endpoint = ""
+		networkFSCpy.Status.EndpointIPv6 = ""
 		networkFSCpy.Status.Status = networkfsv1.EndpointStatusNotReady
 		networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
 		networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabling
@@ -120,6 +141,7 @@ func (c *Controller) OnEndpointSliceChange(_ string, endpointSlice *discoveryv1.
 			networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
 		}
 		networkFSCpy.Status.Endpoint = address
+		networkFSCpy.Status.EndpointIPv6 = addressIPv6
 		networkFSCpy.Status.Status = networkfsv1.EndpointStatusReady
 		networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
 		networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabling
@@ -143,16 +165,29 @@ func (c *Controller) OnEndpointSliceChange(_ string, endpointSlice *discoveryv1.
 	return nil, nil
 }
 
-// firstReadyAddress returns the first address of a ready endpoint in the slice.
-// A nil Ready condition is treated as ready, as defined by the EndpointSlice API.
-func firstReadyAddress(endpointSlice *discoveryv1.EndpointSlice) string {
-	for _, endpoint := range endpointSlice.Endpoints {
-		if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
-			continue
-		}
-		if len(endpoint.Addresses) > 0 {
-			return endpoint.Addresses[0]
+// firstReadyAddresses returns the IPv4 and IPv6 addresses of the first ready endpoint found
+// across endpointSlices. A nil Ready condition is treated as ready, as defined by the
+// EndpointSlice API. A dual-stack service has one EndpointSlice per IP family, so the pick
+// is merged across all of them rather than assuming a single slice carries both families.
+func firstReadyAddresses(endpointSlices []*discoveryv1.EndpointSlice) (string, string) {
+	var ipv4, ipv6 string
+	for _, endpointSlice := range endpointSlices {
+		for _, endpoint := range endpointSlice.Endpoints {
+			if endpoint.Conditions.Ready != nil && !*endpoint.Conditions.Ready {
+				continue
+			}
+			if len(endpoint.Addresses) == 0 {
+				continue
+			}
+			v4, v6 := utils.SelectEndpointAddresses(endpoint.Addresses)
+			if ipv4 == "" {
+				ipv4 = v4
+			}
+			if ipv6 == "" {
+				ipv6 = v6
+			}
+			break
 		}
 	}
-	return ""
+	return ipv4, ipv6
 }

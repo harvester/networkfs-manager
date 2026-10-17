@@ -153,8 +153,10 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 		return nil, fmt.Errorf("wait the share manager %s to be running", networkFS.Name)
 	}
 
-	// LH RWX volume endpoint should only have one address and one port
+	// LH RWX volume endpoint should only have one endpoint and one port, but may carry
+	// up to two addresses (one per IP family) once the ShareManager Service is dual-stack
 	netFSEndpoint := ""
+	netFSEndpointIPv6 := ""
 	service, err := c.coreClient.Service().Get(utils.LHNameSpace, networkFS.Name, metav1.GetOptions{})
 	if err != nil {
 		logrus.Errorf("Failed to get service %s: %v", networkFS.Name, err)
@@ -167,7 +169,14 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 			logrus.Infof("Skip update on networkfs controller with the first time service init")
 			return nil, nil
 		}
-		netFSEndpoint = service.Spec.ClusterIP
+		clusterIPs := service.Spec.ClusterIPs
+		if len(clusterIPs) == 0 {
+			clusterIPs = []string{service.Spec.ClusterIP}
+		}
+		netFSEndpoint, netFSEndpointIPv6 = utils.SelectEndpointAddresses(clusterIPs)
+		if netFSEndpoint == "" && netFSEndpointIPv6 == "" {
+			netFSEndpoint = service.Spec.ClusterIP
+		}
 	} else {
 		endpointSlices, err := c.endpointSliceClient.List(utils.LHNameSpace, metav1.ListOptions{
 			LabelSelector: discoveryv1.LabelServiceName + "=" + networkFS.Name,
@@ -180,21 +189,41 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 			logrus.Infof("Service %s has no endpointslice (not ready), skip this round!", networkFS.Name)
 			return nil, nil
 		}
-		if len(endpointSlices.Items) > 1 {
-			return nil, fmt.Errorf("service %s has more than one endpointslice", networkFS.Name)
+		// A dual-stack ClusterIPNone service gets one EndpointSlice per IP family from the
+		// standard Kubernetes EndpointSlice controller, so up to 2 slices is expected.
+		if len(endpointSlices.Items) > 2 {
+			return nil, fmt.Errorf("service %s has more than two endpointslices", networkFS.Name)
 		}
-		endpointSlice := &endpointSlices.Items[0]
-		if len(endpointSlice.Endpoints) == 0 || len(endpointSlice.Endpoints[0].Addresses) == 0 {
+		var endpointAddresses []string
+		for i := range endpointSlices.Items {
+			endpointSlice := &endpointSlices.Items[i]
+			if len(endpointSlice.Endpoints) == 0 || len(endpointSlice.Endpoints[0].Addresses) == 0 {
+				continue
+			}
+			if len(endpointSlice.Endpoints) > 1 || len(endpointSlice.Ports) > 1 {
+				return nil, fmt.Errorf("endpointslice %s of service %s has more than one endpoint", endpointSlice.Name, networkFS.Name)
+			}
+			if len(endpointSlice.Ports) == 0 || endpointSlice.Ports[0].Name == nil || *endpointSlice.Ports[0].Name != "nfs" {
+				return nil, fmt.Errorf("endpointslice %s of service %s has no nfs port", endpointSlice.Name, networkFS.Name)
+			}
+			// A nil Ready condition is treated as ready, as defined by the EndpointSlice API;
+			// only skip endpoints explicitly marked not ready, so a slow-to-converge family
+			// (e.g. IPv4 still coming up while IPv6 is ready) doesn't get selected.
+			if ready := endpointSlice.Endpoints[0].Conditions.Ready; ready != nil && !*ready {
+				logrus.Infof("EndpointSlice %s of service %s is not ready, skip its address", endpointSlice.Name, networkFS.Name)
+				continue
+			}
+			logrus.Infof("EndpointSlice %s of service %s has address type %s", endpointSlice.Name, networkFS.Name, endpointSlice.AddressType)
+			endpointAddresses = append(endpointAddresses, endpointSlice.Endpoints[0].Addresses...)
+		}
+		if len(endpointAddresses) == 0 {
 			logrus.Infof("EndpointSlice of service %s has no endpoints (not ready), skip this round!", networkFS.Name)
 			return nil, nil
 		}
-		if len(endpointSlice.Endpoints) > 1 || len(endpointSlice.Endpoints[0].Addresses) > 1 || len(endpointSlice.Ports) > 1 {
-			return nil, fmt.Errorf("endpointslice of service %s has more than one endpoint", networkFS.Name)
+		if len(endpointAddresses) > 2 {
+			return nil, fmt.Errorf("service %s has more than two endpoint addresses across its endpointslices", networkFS.Name)
 		}
-		if len(endpointSlice.Ports) == 0 || endpointSlice.Ports[0].Name == nil || *endpointSlice.Ports[0].Name != "nfs" {
-			return nil, fmt.Errorf("endpointslice of service %s has no nfs port", networkFS.Name)
-		}
-		netFSEndpoint = endpointSlice.Endpoints[0].Addresses[0]
+		netFSEndpoint, netFSEndpointIPv6 = utils.SelectEndpointAddresses(endpointAddresses)
 	}
 
 	pv, err := c.coreClient.PersistentVolume().Get(networkFS.Name, metav1.GetOptions{})
@@ -206,7 +235,13 @@ func (c *Controller) enableNetworkFS(networkFS *networkfsv1.NetworkFilesystem) (
 	if _, found := pv.Spec.CSI.VolumeAttributes["nfsOptions"]; found {
 		opts = pv.Spec.CSI.VolumeAttributes["nfsOptions"]
 	}
-	networkFSNew := setNetworkFSToEnabled(networkFS, networkfsv1.NetworkFSTypeNFS, netFSEndpoint, opts)
+	// Status.Endpoint is the primary, IPv4-first value consumers mount; fall back to the
+	// IPv6 pick when only an IPv6 address is available so we never publish Enabled/Ready
+	// with an empty endpoint.
+	if netFSEndpoint == "" {
+		netFSEndpoint = netFSEndpointIPv6
+	}
+	networkFSNew := setNetworkFSToEnabled(networkFS, networkfsv1.NetworkFSTypeNFS, netFSEndpoint, netFSEndpointIPv6, opts)
 	// update network filesystem status
 	return c.NetworkFilsystems.UpdateStatus(networkFSNew)
 }
@@ -308,11 +343,11 @@ func setNetworkFSToEnabling(networkFS *networkfsv1.NetworkFilesystem, targetNetF
 	return networkFSCpy
 }
 
-func setNetworkFSToEnabled(networkFS *networkfsv1.NetworkFilesystem, targetNetFS, endpoint, opts string) *networkfsv1.NetworkFilesystem {
+func setNetworkFSToEnabled(networkFS *networkfsv1.NetworkFilesystem, targetNetFS, endpoint, endpointIPv6, opts string) *networkfsv1.NetworkFilesystem {
 	networkFSCpy := networkFS.DeepCopy()
 	setNetworkFSStatus(networkFSCpy, networkfsv1.NetworkFSStateEnabled, networkfsv1.EndpointStatusReady)
 	setNetworkFSType(networkFSCpy, targetNetFS)
-	setNetworkFSEndpoint(networkFSCpy, endpoint)
+	setNetworkFSEndpoint(networkFSCpy, endpoint, endpointIPv6)
 	setNetworkFSOpts(networkFSCpy, opts)
 	conds := networkfsv1.NetworkFSCondition{
 		Type:               networkfsv1.ConditionTypeEndpointChanged,
@@ -336,8 +371,9 @@ func setNetworkFSType(networkFS *networkfsv1.NetworkFilesystem, targetNetFS stri
 	networkFS.Status.Type = targetNetFS
 }
 
-func setNetworkFSEndpoint(networkFS *networkfsv1.NetworkFilesystem, endpoint string) {
+func setNetworkFSEndpoint(networkFS *networkfsv1.NetworkFilesystem, endpoint, endpointIPv6 string) {
 	networkFS.Status.Endpoint = endpoint
+	networkFS.Status.EndpointIPv6 = endpointIPv6
 }
 
 func setNetworkFSOpts(networkFS *networkfsv1.NetworkFilesystem, opts string) {
