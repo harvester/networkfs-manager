@@ -2,17 +2,16 @@ package endpointslice
 
 import (
 	"context"
-	"reflect"
-	"strings"
 
 	ctlcorev1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	ctldiscoveryv1 "github.com/rancher/wrangler/v3/pkg/generated/controllers/discovery/v1"
 	"github.com/sirupsen/logrus"
-	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	networkfsv1 "github.com/harvester/networkfs-manager/pkg/apis/harvesterhci.io/v1beta1"
+	"github.com/harvester/networkfs-manager/pkg/controller/endpoint"
+	networkfsstatus "github.com/harvester/networkfs-manager/pkg/controller/networkfilesystem/status"
 	ctlntefsv1 "github.com/harvester/networkfs-manager/pkg/generated/controllers/harvesterhci.io/v1beta1"
 	"github.com/harvester/networkfs-manager/pkg/utils"
 )
@@ -56,90 +55,45 @@ func (c *Controller) OnEndpointSliceChange(_ string, endpointSlice *discoveryv1.
 		logrus.Infof("Skip this round because endpointslice is deleted or deleting")
 		return nil, nil
 	}
+	if endpointSlice.Namespace != utils.LHNameSpace {
+		return nil, nil
+	}
 
 	// the endpointslice name has a generated suffix, the owning service name is kept in the well-known label
 	svcName := endpointSlice.Labels[discoveryv1.LabelServiceName]
-
-	// we only care about the endpointslice of the service with name prefix "pvc-"
-	if !strings.HasPrefix(svcName, "pvc-") {
+	if svcName == "" {
 		return nil, nil
 	}
 
-	logrus.Infof("Handling endpointslice %s (service %s) change event", endpointSlice.Name, svcName)
-	networkFS, err := c.NetworkFilsystems.Get(c.namespace, svcName, metav1.GetOptions{})
+	service, err := c.serviceClient.Get(endpointSlice.Namespace, svcName, metav1.GetOptions{})
 	if err != nil {
-		logrus.Errorf("Failed to get networkFS %s: %v", svcName, err)
-		return nil, err
-	}
-
-	// only update when the networkfilesystem is enabled.
-	if networkFS.Spec.DesiredState != networkfsv1.NetworkFSStateEnabled {
-		logrus.Infof("Skip update with endpointslice change event because networkfilesystem %s is not enabled", networkFS.Name)
-		return nil, nil
-	}
-
-	// skip update if the service.Spec.ClusterIP is not ClusterIPNone (means the we depends on service)
-	service, err := c.serviceClient.Get(utils.LHNameSpace, svcName, metav1.GetOptions{})
-	if err != nil {
+		if apierrors.IsNotFound(err) {
+			logrus.Infof("Skip stale endpointslice %s because service %s no longer exists", endpointSlice.Name, svcName)
+			return nil, nil
+		}
 		logrus.Errorf("Failed to get service %s: %v", svcName, err)
 		return nil, err
 	}
-	if service.Spec.ClusterIP != corev1.ClusterIPNone {
-		logrus.Infof("Skip update with endpointslice change event because service %s is not ClusterIPNone", service.Name)
+
+	volumeName, selection, managed, err := endpoint.ResolveService(c.serviceClient, service.Namespace, service)
+	if err != nil {
+		logrus.Errorf("Failed to resolve endpoint service for networkFS %s: %v", volumeName, err)
+		return nil, err
+	}
+	if !managed {
+		return nil, nil
+	}
+	if selection.Source != endpoint.SourceEndpointSlice {
+		logrus.Infof("Skip endpointslice update because networkFS %s uses %s", volumeName, selection.Source)
 		return nil, nil
 	}
 
-	networkFSCpy := networkFS.DeepCopy()
-	address := firstReadyAddress(endpointSlice)
-	if address == "" {
-		networkFSCpy.Status.Endpoint = ""
-		networkFSCpy.Status.Status = networkfsv1.EndpointStatusNotReady
-		networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
-		networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabling
-		conds := networkfsv1.NetworkFSCondition{
-			Type:               networkfsv1.ConditionTypeNotReady,
-			Status:             corev1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "Endpoint is not ready",
-			Message:            "EndpointSlice did not contain any ready address",
-		}
-		networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
-	} else {
-		if networkFSCpy.Status.Endpoint != address {
-			changedMsg := "Endpoint address is initialized with " + address
-			if networkFSCpy.Status.Endpoint != "" {
-				changedMsg = "Endpoint address is changed, previous address is " + networkFSCpy.Status.Endpoint
-			}
-			conds := networkfsv1.NetworkFSCondition{
-				Type:               networkfsv1.ConditionTypeEndpointChanged,
-				Status:             corev1.ConditionTrue,
-				LastTransitionTime: metav1.Now(),
-				Reason:             "Endpoint is changed",
-				Message:            changedMsg,
-			}
-			networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
-		}
-		networkFSCpy.Status.Endpoint = address
-		networkFSCpy.Status.Status = networkfsv1.EndpointStatusReady
-		networkFSCpy.Status.Type = networkfsv1.NetworkFSTypeNFS
-		networkFSCpy.Status.State = networkfsv1.NetworkFSStateEnabling
-		conds := networkfsv1.NetworkFSCondition{
-			Type:               networkfsv1.ConditionTypeReady,
-			Status:             corev1.ConditionTrue,
-			LastTransitionTime: metav1.Now(),
-			Reason:             "Endpoint is ready",
-			Message:            "EndpointSlice contains the corresponding address",
-		}
-		networkFSCpy.Status.NetworkFSConds = utils.UpdateNetworkFSConds(networkFSCpy.Status.NetworkFSConds, conds)
+	logrus.Infof("Handling endpointslice %s (service %s) change event for network filesystem %s", endpointSlice.Name, svcName, volumeName)
+	selection.Address = firstReadyAddress(endpointSlice)
+	if err := networkfsstatus.ReconcileEndpoint(c.NetworkFilsystems, c.namespace, volumeName, selection); err != nil {
+		logrus.Errorf("Failed to reconcile endpoint for networkFS %s: %v", volumeName, err)
+		return nil, err
 	}
-
-	if !reflect.DeepEqual(networkFS, networkFSCpy) {
-		if _, err := c.NetworkFilsystems.UpdateStatus(networkFSCpy); err != nil {
-			logrus.Errorf("Failed to update networkFS %s: %v", networkFS.Name, err)
-			return nil, err
-		}
-	}
-
 	return nil, nil
 }
 
